@@ -1,0 +1,224 @@
+@import "tailwindcss";
+
+:root {
+  --background: #ffffff;
+  --foreground: #111111;
+  
+  --color-orange: #ff5500;
+  --color-orange-hover: #e04b00;
+  --color-orange-light: #fff2eb;
+  
+  --color-border: #e5e5e5;
+  --color-border-dark: #111111;
+  --color-bg-card: #ffffff;
+  --color-bg-alt: #fafafa;
+  --color-text-muted: #666666;
+  
+  --font-sans: 'Outfit', 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', Menlo, monospace;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background-color: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
+}
+
+/* Custom Typography */
+h1, h2, h3, h4, h5, h6 {
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--foreground);
+}
+
+code, pre {
+  font-family: var(--font-mono);
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: var(--color-bg-alt);
+}
+::-webkit-scrollbar-thumb {
+  background: #cccccc;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #999999;
+}
+
+/* Base styles for simulator elements */
+.btn-primary {
+  background-color: var(--color-orange);
+  color: #ffffff;
+  border: 1px solid var(--color-orange);
+  padding: 10px 16px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.btn-primary:hover {
+  background-color: var(--color-orange-hover);
+  border-color: var(--color-orange-hover);
+}
+
+.btn-primary:disabled {
+  background-color: #cccccc;
+  border-color: #cccccc;
+  cursor: not-allowed;
+}
+
+.btn-secondary {
+  background-color: #ffffff;
+  color: var(--foreground);
+  border: 1px solid var(--color-border-dark);
+  padding: 10px 16px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.btn-secondary:hover {
+  background-color: var(--color-bg-alt);
+}
+
+.input-field {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--color-border);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  background-color: #ffffff;
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+
+.input-field:focus {
+  border-color: var(--color-border-dark);
+}
+
+.input-label {
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--color-text-muted);
+}
+
+/* Card and Container Styles */
+.card {
+  background: var(--color-bg-card);
+  border: 1px solid var(--color-border);
+  padding: 24px;
+  margin-bottom: 20px;
+  position: relative;
+}
+
+.card-title {
+  font-size: 18px;
+  font-weight: 700;
+  margin-bottom: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--color-border);
+  padding-bottom: 12px;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.badge-success {
+  background-color: #e6f7ed;
+  color: #1e8a44;
+}
+
+.badge-failed {
+  background-color: #fcebeb;
+  color: #cc2929;
+}
+
+.badge-warning {
+  background-color: #fff8eb;
+  color: #b37400;
+}
+
+.badge-orange {
+  background-color: var(--color-orange-light);
+  color: var(--color-orange);
+}
+
+.badge-neutral {
+  background-color: var(--color-bg-alt);
+  color: var(--foreground);
+  border: 1px solid var(--color-border);
+}
+
+/* Terminal logs styles */
+.terminal {
+  background-color: #111111;
+  color: #f5f5f5;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 16px;
+  overflow-y: auto;
+  border: 1px solid #000000;
+}
+
+.terminal-line {
+  margin-bottom: 8px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.terminal-tag {
+  display: inline-block;
+  padding: 1px 4px;
+  font-weight: 700;
+  margin-right: 6px;
+  font-size: 10px;
+  letter-spacing: 0.05em;
+}
+
+.tag-kafka { background-color: var(--color-orange); color: white; }
+.tag-redis { background-color: #2b70f0; color: white; }
+.tag-kms { background-color: #7928ca; color: white; }
+.tag-sqlite { background-color: #0070f3; color: white; }
+.tag-router { background-color: #0070f3; color: white; }
+.tag-ledger { background-color: #111111; color: #00ff66; border: 1px solid #00ff66; }
+.tag-circuit { background-color: #ff0055; color: white; }
+.tag-webhook { background-color: #df00d8; color: white; }
+.tag-fraud { background-color: #f5a623; color: black; }
+.tag-system { background-color: #666666; color: white; }

@@ -1,9 +1,6 @@
 # Orchestra: High-Reliability Payment Orchestration Platform
 
 
-
----
-
 ## Overview
 
 **Orchestra** is an enterprise-grade **Payment Orchestration Engine & Developer Simulator** designed to model high-reliability multi-gateway payment processing. It solves the critical distributed systems challenges in fintech: **smart dynamic routing, duplicate payment prevention (two-phase atomic idempotency), gateway timeout safety, PCI-DSS tokenization isolation, double-entry bookkeeping, and bank settlement reconciliation**.

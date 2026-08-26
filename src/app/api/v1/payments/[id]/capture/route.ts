@@ -12,24 +12,37 @@ export async function POST(
     const { id } = await params;
 
     // Fetch the payment
-    const payment = await db.get('SELECT * FROM payments WHERE id = ?', [id]);
+    const payment = await db.get<any>('SELECT * FROM payments WHERE id = ?', [id]);
     if (!payment) {
       return NextResponse.json({ error: 'Payment not found' }, { status: 404 });
     }
 
-    const { status, amount, currency, merchant_id, provider } = payment as any;
+    const { status, amount, currency, merchant_id, provider, version = 1 } = payment;
 
     if (status !== 'AUTHORIZED') {
-      return NextResponse.json({ error: `Cannot capture payment with status: ${status}. Expected: AUTHORIZED.` }, { status: 400 });
+      return NextResponse.json(
+        { error: `Cannot capture payment with status: ${status}. Expected: AUTHORIZED.` },
+        { status: 400 }
+      );
     }
 
-    // Capture payment
-    await db.run("UPDATE payments SET status = 'CAPTURED', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [id]);
+    // Optimistic locking guard
+    const updateResult = await db.run(
+      "UPDATE payments SET status = 'CAPTURED', version = version + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'AUTHORIZED' AND version = ?",
+      [id, version]
+    );
 
-    // Calculate fees
+    if (updateResult.changes === 0) {
+      return NextResponse.json(
+        { error: 'Concurrent modification detected during payment capture. Please retry.' },
+        { status: 409 }
+      );
+    }
+
+    // Calculate gateway fees
     const computedFee = SmartRouter.calculateFee(provider, amount, currency);
 
-    // Post to ledger
+    // Post to atomic double-entry ledger
     await LedgerService.postLedgerEntries({
       paymentId: id,
       merchantId: merchant_id,
@@ -37,25 +50,18 @@ export async function POST(
       amount,
       currency,
       fee: computedFee,
-      type: 'CAPTURE'
+      type: 'CAPTURE',
     });
 
-    // Move status to settled
-    await db.run("UPDATE payments SET status = 'SETTLED' WHERE id = ?", [id]);
+    // Move status to SETTLED
+    await db.run("UPDATE payments SET status = 'SETTLED', updated_at = CURRENT_TIMESTAMP WHERE id = ?", [id]);
 
     memoryStore.publishEvent('payment.captured', `Authorized payment ${id} captured and settled via ${provider}`, {
       paymentId: id,
       amount,
       currency,
-      provider
+      provider,
     });
-
-    // Notify merchant via webhook
-    const merchant = await db.get('SELECT webhook_url FROM merchants WHERE id = ?', [merchant_id]);
-    if (merchant && (merchant as any).webhook_url) {
-      // Trigger simple log, background webhook dispatched
-      memoryStore.publishEvent('webhook.enqueued', `Webhook enqueued for payment capture event on ${id}`, { paymentId: id });
-    }
 
     return NextResponse.json({
       id,
@@ -63,7 +69,7 @@ export async function POST(
       amount,
       currency,
       status: 'SETTLED',
-      provider
+      provider,
     });
   } catch (err: any) {
     console.error('Error capturing payment:', err);

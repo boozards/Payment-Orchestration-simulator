@@ -6,9 +6,9 @@ import { FraudEngine } from '@/lib/services/fraud';
 import { SmartRouter } from '@/lib/services/router';
 import { CircuitBreakerManager } from '@/lib/services/circuitBreaker';
 import { LedgerService } from '@/lib/services/ledger';
+import { GatewayAdapterRegistry } from '@/lib/adapters/gatewayAdapter';
 import crypto from 'crypto';
 
-// Helper to simulate sleep
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // GET /api/v1/payments - List payments (for dashboard)
@@ -36,11 +36,11 @@ export async function GET(req: NextRequest) {
   }
 }
 
-// POST /api/v1/payments - Create a payment (authorize or capture)
+// POST /api/v1/payments - Create a payment with two-phase idempotency & timeout safety
 export async function POST(req: NextRequest) {
   const paymentId = 'pay_' + crypto.randomBytes(8).toString('hex');
   let idempotencyKey = req.headers.get('Idempotency-Key') || '';
-  
+
   try {
     const body = await req.json();
     const {
@@ -60,46 +60,68 @@ export async function POST(req: NextRequest) {
       idempotencyKey = body.idempotency_key;
     }
 
-    // 1. Idempotency Check (Redis SET NX)
+    // 1. Two-Phase Atomic Idempotency Check & Lock
     if (idempotencyKey) {
-      const cached = memoryStore.getIdempotency(idempotencyKey);
-      if (cached) {
+      const requestHash = crypto
+        .createHash('sha256')
+        .update(JSON.stringify({ merchant_id, amount, currency, card_token, customer_id }))
+        .digest('hex');
+
+      const lockResult = memoryStore.acquireIdempotencyLock(idempotencyKey, merchant_id, requestHash);
+
+      if (lockResult.status === 'IN_PROGRESS') {
+        return NextResponse.json(
+          {
+            error: 'Concurrent request in progress for this Idempotency-Key. Please wait or retry shortly.',
+            code: 'IDEMPOTENCY_IN_PROGRESS',
+          },
+          { status: 409 }
+        );
+      }
+
+      if (lockResult.status === 'COMPLETED') {
         memoryStore.publishEvent('idempotency.hit', `Idempotency cache HIT for key: ${idempotencyKey}`, { idempotencyKey });
-        return NextResponse.json(cached.response, {
-          headers: { 'X-Cache': 'HIT' }
+        return NextResponse.json(lockResult.response, {
+          status: lockResult.statusCode,
+          headers: { 'X-Cache': 'HIT' },
         });
       }
     }
 
     // Validation
     if (!merchant_id || !amount || !currency || !card_token || !customer_id) {
-      return NextResponse.json({ error: 'Missing required parameters: merchant_id, amount, currency, card_token, and customer_id are required' }, { status: 400 });
+      if (idempotencyKey) memoryStore.releaseIdempotencyLock(idempotencyKey);
+      return NextResponse.json(
+        { error: 'Missing required parameters: merchant_id, amount, currency, card_token, and customer_id are required' },
+        { status: 400 }
+      );
     }
 
     // 2. Authorize Merchant
     const merchant = await db.get<any>('SELECT * FROM merchants WHERE id = ?', [merchant_id]);
     if (!merchant) {
+      if (idempotencyKey) memoryStore.releaseIdempotencyLock(idempotencyKey);
       return NextResponse.json({ error: 'Merchant not found' }, { status: 404 });
     }
 
     let enabledProviders = ['stripe', 'paypal', 'razorpay'];
     try {
-      enabledProviders = JSON.parse((merchant as any).enabled_providers);
-    } catch (e) {
+      enabledProviders = JSON.parse(merchant.enabled_providers);
+    } catch {
       // Use defaults
     }
 
     // 3. Detokenize Card for verification
     const cardDetails = TokenizationVault.detokenize(card_token);
     if (!cardDetails) {
+      if (idempotencyKey) memoryStore.releaseIdempotencyLock(idempotencyKey);
       return NextResponse.json({ error: 'Invalid or expired card_token' }, { status: 400 });
     }
 
-    // Masked details for storage
     const maskedNumber = `•••• •••• •••• ${cardDetails.number.slice(-4)}`;
     const cardBrand = cardDetails.number.startsWith('4') ? 'Visa' : 'Mastercard';
 
-    // 4. Fraud Detection
+    // 4. Fraud Detection Screening
     const fraudResult = await FraudEngine.evaluate(
       merchant_id,
       amount,
@@ -109,17 +131,16 @@ export async function POST(req: NextRequest) {
       {
         email: metadata.email || `${customer_id}@example.com`,
         ipCountry: metadata.ipCountry || 'US',
-        cardCountry: metadata.cardCountry || 'US'
+        cardCountry: metadata.cardCountry || 'US',
       }
     );
 
     if (fraudResult.action === 'BLOCK') {
       const failureReason = `Blocked by Fraud Engine: ${fraudResult.reasons.join(', ')}`;
-      
-      // Save failed payment record
+
       await db.run(
-        `INSERT INTO payments (id, merchant_id, idempotency_key, amount, currency, status, customer_id, metadata, failure_reason)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO payments (id, merchant_id, idempotency_key, amount, refunded_amount, currency, status, customer_id, metadata, failure_reason)
+         VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)`,
         [
           paymentId,
           merchant_id,
@@ -129,7 +150,7 @@ export async function POST(req: NextRequest) {
           'FAILED',
           customer_id,
           JSON.stringify({ ...metadata, maskedCard: maskedNumber, cardBrand, fraudScore: fraudResult.score, fraudBlocked: true }),
-          failureReason
+          failureReason,
         ]
       );
 
@@ -140,17 +161,17 @@ export async function POST(req: NextRequest) {
         currency,
         status: 'FAILED',
         failure_reason: failureReason,
-        fraud_check: { score: fraudResult.score, action: 'BLOCK' }
+        fraud_check: { score: fraudResult.score, action: 'BLOCK' },
       };
 
       if (idempotencyKey) {
-        memoryStore.setIdempotency(idempotencyKey, errorResponse);
+        memoryStore.completeIdempotencyLock(idempotencyKey, errorResponse, 400);
       }
 
       return NextResponse.json(errorResponse, { status: 400 });
     }
 
-    // 5. Smart Routing Configuration
+    // 5. Smart Routing Selection
     const routingResult = SmartRouter.routePayment(
       enabledProviders,
       amount,
@@ -159,17 +180,16 @@ export async function POST(req: NextRequest) {
       manual_provider
     );
 
-    // Save payment record with CREATED status
+    // Persist Payment in PROCESSING status
     await db.run(
-      `INSERT INTO payments (id, merchant_id, idempotency_key, amount, currency, status, customer_id, metadata)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO payments (id, merchant_id, idempotency_key, amount, refunded_amount, currency, status, customer_id, metadata)
+       VALUES (?, ?, ?, ?, 0, ?, 'PROCESSING', ?, ?)`,
       [
         paymentId,
         merchant_id,
         idempotencyKey || null,
         amount,
         currency,
-        'CREATED',
         customer_id,
         JSON.stringify({
           ...metadata,
@@ -177,8 +197,8 @@ export async function POST(req: NextRequest) {
           cardBrand,
           fraudScore: fraudResult.score,
           flagged: fraudResult.action === 'FLAG',
-          fraudReasons: fraudResult.reasons
-        })
+          fraudReasons: fraudResult.reasons,
+        }),
       ]
     );
 
@@ -188,117 +208,97 @@ export async function POST(req: NextRequest) {
     let finalStatus = 'FAILED';
     let failureReason = '';
     let providerTransactionId = '';
+    let isAmbiguousTimeout = false;
 
-    // 6. Execute Attempt & Failover Loop
-    // Try up to 3 attempts (allowing Smart Failover if provider is degraded)
-    while (attemptNumber <= 3 && !success) {
-      const cbState = memoryStore.circuitBreakers[activeProvider];
-      const simulatedSuccessRate = cbState?.customSuccessRate ?? 90;
-      const simulatedBaseLatency = cbState?.customLatency ?? 200;
+    // 6. Polymorphic Gateway Execution & Failover Loop
+    while (attemptNumber <= 3 && !success && !isAmbiguousTimeout) {
+      const adapter = GatewayAdapterRegistry.getAdapter(activeProvider);
 
       memoryStore.publishEvent('provider.attempt', `Sending transaction to ${activeProvider} (Attempt ${attemptNumber}/3)...`, {
         paymentId,
         provider: activeProvider,
-        attemptNumber
+        attemptNumber,
       });
 
-      // Track latency
-      const startMs = Date.now();
-      
-      // Sleep to simulate provider call duration
-      await sleep(simulatedBaseLatency + Math.floor(Math.random() * 80));
-
-      const latencyMs = Date.now() - startMs;
-
-      // Determine Mock Provider Response
-      let attemptStatus: 'SUCCESS' | 'FAILED' = 'SUCCESS';
-      let attemptErrorMsg = '';
-
-      // Test Card Patterns
-      const last4 = cardDetails.number.slice(-4);
-      if (last4 === '9999') {
-        attemptStatus = 'FAILED';
-        attemptErrorMsg = 'Card Declined: Insufficient Funds';
-      } else if (last4 === '8888') {
-        attemptStatus = 'FAILED';
-        attemptErrorMsg = 'Gateway Timeout: Provider did not respond';
-      } else if (last4 === '7777') {
-        attemptStatus = 'FAILED';
-        attemptErrorMsg = '3DS Required: Authentication failed';
-      } else {
-        // Evaluate based on provider health setting
-        const randomRoll = Math.random() * 100;
-        if (randomRoll > simulatedSuccessRate) {
-          attemptStatus = 'FAILED';
-          attemptErrorMsg = `Provider API Error: Internal server error (roll: ${randomRoll.toFixed(1)} > success: ${simulatedSuccessRate}%)`;
-        }
-      }
+      const gatewayResp = await adapter.executePayment({
+        paymentId,
+        amount,
+        currency,
+        cardDetails,
+        customerId: customer_id,
+        capture,
+        metadata,
+      });
 
       const attemptId = 'att_' + crypto.randomBytes(8).toString('hex');
-      const providerResp = attemptStatus === 'SUCCESS' 
-        ? { transaction_id: 'tx_' + crypto.randomBytes(10).toString('hex'), status: 'succeeded' }
-        : { error: attemptErrorMsg, code: 'processing_error' };
 
-      // Write payment attempt audit log
+      // Record attempt log in SQLite
       await db.run(
-        `INSERT INTO payment_attempts (id, payment_id, provider, attempt_number, status, provider_response, latency_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO payment_attempts (id, payment_id, provider, attempt_number, status, outcome, provider_response, latency_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           attemptId,
           paymentId,
           activeProvider,
           attemptNumber,
-          attemptStatus,
-          JSON.stringify(providerResp),
-          latencyMs
+          gatewayResp.success ? 'SUCCESS' : 'FAILED',
+          gatewayResp.outcome,
+          JSON.stringify(gatewayResp.rawResponse),
+          gatewayResp.latencyMs,
         ]
       );
 
-      if (attemptStatus === 'SUCCESS') {
+      if (gatewayResp.success) {
         success = true;
-        providerTransactionId = (providerResp as any).transaction_id;
+        providerTransactionId = gatewayResp.transactionId || '';
         finalStatus = capture ? 'CAPTURED' : 'AUTHORIZED';
-        
+
         CircuitBreakerManager.recordSuccess(activeProvider);
-        memoryStore.publishEvent('provider.success', `Provider ${activeProvider} processed payment successfully in ${latencyMs}ms`, {
+        memoryStore.publishEvent('provider.success', `Provider ${activeProvider} processed payment successfully in ${gatewayResp.latencyMs}ms`, {
           paymentId,
           provider: activeProvider,
-          latencyMs
+          latencyMs: gatewayResp.latencyMs,
+        });
+      } else if (gatewayResp.outcome === 'AMBIGUOUS_TIMEOUT') {
+        // CRITICAL FIX: Gateway timeout is an ambiguous state. DO NOT blindly failover to another provider!
+        isAmbiguousTimeout = true;
+        finalStatus = 'PENDING_INQUIRY';
+        failureReason = gatewayResp.errorMessage || 'Gateway Timeout: Inquiring status';
+
+        CircuitBreakerManager.recordFailure(activeProvider, failureReason);
+        memoryStore.publishEvent('provider.timeout_guarded', `Provider ${activeProvider} timed out. Set to PENDING_INQUIRY to prevent double charge.`, {
+          paymentId,
+          provider: activeProvider,
         });
       } else {
-        CircuitBreakerManager.recordFailure(activeProvider, attemptErrorMsg);
-        failureReason = attemptErrorMsg;
+        // Deterministic Decline (insufficient funds, CVV mismatch, or provider rejection)
+        CircuitBreakerManager.recordFailure(activeProvider, gatewayResp.errorMessage || 'API Error');
+        failureReason = gatewayResp.errorMessage || 'Transaction declined';
 
-        memoryStore.publishEvent('provider.failed', `Provider ${activeProvider} failed: ${attemptErrorMsg} (${latencyMs}ms)`, {
+        memoryStore.publishEvent('provider.failed', `Provider ${activeProvider} declined: ${failureReason} (${gatewayResp.latencyMs}ms)`, {
           paymentId,
           provider: activeProvider,
-          latencyMs
+          latencyMs: gatewayResp.latencyMs,
         });
 
-        // Trigger Failover or retry
-        if (attemptNumber < 3) {
-          // Identify next provider for Smart Failover
-          const remainingProviders = enabledProviders.filter(p => p.toLowerCase() !== activeProvider);
+        // Only failover to another provider if the failure was a provider network/server error, NOT a bad card
+        const isBadCard = gatewayResp.errorCode === 'insufficient_funds' || gatewayResp.errorCode === 'authentication_required';
+
+        if (!isBadCard && attemptNumber < 3) {
+          const remainingProviders = enabledProviders.filter((p) => p.toLowerCase() !== activeProvider.toLowerCase());
           if (remainingProviders.length > 0) {
-            // Select next best provider
-            const nextRouting = SmartRouter.routePayment(
-              remainingProviders,
-              amount,
-              currency,
-              'HIGHEST_SUCCESS'
-            );
+            const nextRouting = SmartRouter.routePayment(remainingProviders, amount, currency, 'HIGHEST_SUCCESS');
             activeProvider = nextRouting.selectedProvider;
             memoryStore.publishEvent('router.failover_switch', `Smart Failover: Switching checkout target to ${activeProvider}`, {
               paymentId,
-              failedProvider: activeProvider
+              failedProvider: activeProvider,
             });
+            attemptNumber++;
+            await sleep(100 * Math.pow(2, attemptNumber));
+          } else {
+            attemptNumber++;
           }
-          // Increment attempt count
-          attemptNumber++;
-          // Exponential backoff delay
-          await sleep(100 * Math.pow(2, attemptNumber));
         } else {
-          // End of loops
           attemptNumber++;
         }
       }
@@ -308,15 +308,15 @@ export async function POST(req: NextRequest) {
     const finalUpdateAt = new Date().toISOString();
     await db.run(
       `UPDATE payments 
-       SET status = ?, provider = ?, provider_transaction_id = ?, failure_reason = ?, updated_at = ?
+       SET status = ?, provider = ?, provider_transaction_id = ?, failure_reason = ?, version = version + 1, updated_at = ?
        WHERE id = ?`,
       [
         finalStatus,
-        success ? activeProvider : null,
+        success || isAmbiguousTimeout ? activeProvider : null,
         success ? providerTransactionId : null,
         success ? null : failureReason,
         finalUpdateAt,
-        paymentId
+        paymentId,
       ]
     );
 
@@ -330,10 +330,9 @@ export async function POST(req: NextRequest) {
         amount,
         currency,
         fee: computedFee,
-        type: 'CAPTURE'
+        type: 'CAPTURE',
       });
 
-      // Update status to SETTLED (in payment lifecycle, capture leads to settle simulation)
       await db.run(`UPDATE payments SET status = 'SETTLED' WHERE id = ?`, [paymentId]);
       finalStatus = 'SETTLED';
     }
@@ -350,20 +349,22 @@ export async function POST(req: NextRequest) {
       amount,
       currency,
       status: finalStatus,
-      provider: success ? activeProvider : undefined,
+      provider: success || isAmbiguousTimeout ? activeProvider : undefined,
       provider_transaction_id: success ? providerTransactionId : undefined,
       customer_id,
       failure_reason: success ? undefined : failureReason,
-      created_at: new Date().toISOString()
+      created_at: new Date().toISOString(),
     };
 
+    const httpStatusCode = success ? 200 : isAmbiguousTimeout ? 202 : 400;
+
     if (idempotencyKey) {
-      memoryStore.setIdempotency(idempotencyKey, finalPaymentResponse);
+      memoryStore.completeIdempotencyLock(idempotencyKey, finalPaymentResponse, httpStatusCode);
     }
 
-    return NextResponse.json(finalPaymentResponse, { status: success ? 200 : 400 });
-
+    return NextResponse.json(finalPaymentResponse, { status: httpStatusCode });
   } catch (err: any) {
+    if (idempotencyKey) memoryStore.releaseIdempotencyLock(idempotencyKey);
     console.error('Create payment error:', err);
     return NextResponse.json({ error: err.message || 'Internal server error' }, { status: 500 });
   }
@@ -380,15 +381,15 @@ function triggerWebhookSimulation(
 ) {
   const webhookId = 'whk_' + crypto.randomBytes(8).toString('hex');
   const payload = {
-    event: status === 'SETTLED' || status === 'CAPTURED' ? 'payment.succeeded' : 'payment.failed',
+    event: status === 'SETTLED' || status === 'CAPTURED' ? 'payment.succeeded' : status === 'PENDING_INQUIRY' ? 'payment.pending' : 'payment.failed',
     data: {
       id: paymentId,
       merchant_id: merchantId,
       amount,
       currency,
-      status
+      status,
     },
-    created_at: new Date().toISOString()
+    created_at: new Date().toISOString(),
   };
 
   const logRecord: any = {
@@ -399,32 +400,28 @@ function triggerWebhookSimulation(
     status: 'PENDING',
     attempts: 1,
     maxAttempts: 3,
-    logs: [`[${new Date().toISOString()}] Enqueued webhook payload to: ${webhookUrl}`]
+    logs: [`[${new Date().toISOString()}] Enqueued webhook payload to: ${webhookUrl}`],
   };
 
   memoryStore.addWebhookLog(logRecord);
 
-  // Run async simulation
   (async () => {
-    // Wait a couple of seconds before sending
-    await sleep(2000);
-    
-    // Simulate webhook dispatch
+    await sleep(1500);
+
     let success = false;
     let attempts = 1;
-    
+
     while (attempts <= 3 && !success) {
       logRecord.logs.push(`[${new Date().toISOString()}] Dispatch attempt ${attempts}...`);
-      
-      // Let's simulate a flaky endpoint. If webhookUrl contains "flaky", fail with 500 50% of the time.
+
       const isFlaky = webhookUrl.includes('flaky');
       const isOffline = webhookUrl.includes('offline');
-      
+
       if (isOffline) {
         logRecord.logs.push(`[${new Date().toISOString()}] Connection timeout (host unreachable).`);
         logRecord.lastResponse = 'Timeout';
       } else if (isFlaky && Math.random() > 0.5) {
-        logRecord.logs.push(`[${new Date().toISOString()}] FLAKY target returned HTTP 500 Internal Server Error.`);
+        logRecord.logs.push(`[${new Date().toISOString()}] Target returned HTTP 500 Internal Server Error.`);
         logRecord.lastResponse = '500 Internal Server Error';
       } else {
         success = true;
@@ -440,7 +437,7 @@ function triggerWebhookSimulation(
           logRecord.status = 'RETRYING';
           logRecord.attempts = attempts;
           memoryStore.publishEvent('webhook.retry', `Webhook ${webhookId} failed. Scheduling retry ${attempts}/3...`, { webhookId, paymentId });
-          await sleep(5000); // 5s backoff for retry
+          await sleep(3000);
         } else {
           logRecord.status = 'FAILED';
           logRecord.attempts = 3;
@@ -448,8 +445,7 @@ function triggerWebhookSimulation(
         }
       }
     }
-    
-    // Update store
+
     memoryStore.updateWebhookLog(webhookId, logRecord);
   })();
 }

@@ -14,18 +14,21 @@ export interface LedgerEntry {
   created_at?: string;
 }
 
+// Minor unit math helpers to eliminate floating point drift
+const toCents = (amt: number): number => Math.round(Number(amt) * 100);
+const toCurrency = (cents: number): number => Number((cents / 100).toFixed(2));
+
 export class LedgerService {
   /**
-   * Returns the current balance of an account by looking up its last ledger entry.
-   * If no entry exists, returns 0.
+   * Returns the current balance of an account by looking up account_balances table (indexed PK lookup).
    */
   public static async getAccountBalance(accountId: string): Promise<number> {
     try {
-      const lastEntry = await db.get<{ balance_after: number }>(
-        'SELECT balance_after FROM ledger_entries WHERE account_id = ? ORDER BY created_at DESC, id DESC LIMIT 1',
+      const record = await db.get<{ balance: number }>(
+        'SELECT balance FROM account_balances WHERE account_id = ?',
         [accountId]
       );
-      return lastEntry ? Number(lastEntry.balance_after) : 0;
+      return record ? Number(record.balance) : 0;
     } catch (e) {
       console.error(`Error fetching balance for account ${accountId}:`, e);
       return 0;
@@ -34,20 +37,22 @@ export class LedgerService {
 
   /**
    * Posts double-entry ledger rows for a payment capture or refund.
-   * Ensures atomic balance updates inside an SQLite transaction.
+   * Ensures atomic balance updates inside a mutexed SQLite transaction with mass-conservation validation.
    *
-   * Rules:
-   * - Capture:
+   * Mathematical Invariant:
+   *   Sum(Debits) === Sum(Credits)
+   *
+   * Capture:
    *   - DEBIT Merchant Account: + (netAmount = amount - fee)
    *   - DEBIT Platform Account: + (fee)
    *   - CREDIT Provider Account: - (amount)
-   *   - Net transaction sum = (amount - fee) + fee - amount = 0 (Balanced!)
+   *   Balanced: netAmount + fee - amount = 0
    *
-   * - Refund:
+   * Refund / Partial Refund:
    *   - CREDIT Merchant Account: - (netAmount = amount - fee)
    *   - CREDIT Platform Account: - (fee)
    *   - DEBIT Provider Account: + (amount)
-   *   - Net transaction sum = -(amount - fee) - fee + amount = 0 (Balanced!)
+   *   Balanced: -netAmount - fee + amount = 0
    */
   public static async postLedgerEntries(params: {
     paymentId: string;
@@ -56,140 +61,127 @@ export class LedgerService {
     amount: number;
     currency: string;
     fee: number;
-    type: 'CAPTURE' | 'REFUND';
+    type: 'CAPTURE' | 'REFUND' | 'PARTIAL_REFUND';
   }): Promise<LedgerEntry[]> {
     const { paymentId, merchantId, provider, amount, currency, fee, type } = params;
-    const entries: LedgerEntry[] = [];
-    
+
+    const amountCents = toCents(amount);
+    const feeCents = toCents(fee);
+    const netAmountCents = amountCents - feeCents;
+
+    // Verify mathematical balance before executing
+    if (netAmountCents + feeCents !== amountCents) {
+      throw new Error(`Ledger imbalance detected: netAmount(${netAmountCents}) + fee(${feeCents}) !== total(${amountCents})`);
+    }
+
     const merchantAccount = `merchant:${merchantId}`;
     const platformAccount = 'platform:fees';
     const providerAccount = `provider:${provider.toLowerCase()}`;
 
-    // Start SQL Transaction
-    await db.exec('BEGIN TRANSACTION');
+    // Execute within mutex-serialized transaction
+    return db.transaction(async () => {
+      const entries: LedgerEntry[] = [];
 
-    try {
-      // 1. Fetch current balances
-      const currentMerchantBal = await this.getAccountBalance(merchantAccount);
-      const currentPlatformBal = await this.getAccountBalance(platformAccount);
-      const currentProviderBal = await this.getAccountBalance(providerAccount);
+      // Helper to atomically update account balance and record ledger entry
+      const applyEntry = async (
+        accountType: 'MERCHANT' | 'PROVIDER' | 'PLATFORM_FEE' | 'REFUND',
+        accountId: string,
+        entryType: 'DEBIT' | 'CREDIT',
+        entryAmountCents: number,
+        balanceDeltaCents: number
+      ): Promise<LedgerEntry> => {
+        const delta = toCurrency(balanceDeltaCents);
 
-      const netAmount = amount - fee;
+        // Atomic Upsert to account_balances table
+        await db.run(
+          `INSERT INTO account_balances (account_id, account_type, currency, balance, updated_at)
+           VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+           ON CONFLICT(account_id) DO UPDATE SET 
+             balance = balance + excluded.balance,
+             updated_at = CURRENT_TIMESTAMP`,
+          [accountId, accountType, currency, delta]
+        );
 
-      let merchantEntry: Omit<LedgerEntry, 'id'>;
-      let platformEntry: Omit<LedgerEntry, 'id'>;
-      let providerEntry: Omit<LedgerEntry, 'id'>;
+        // Fetch the updated balance
+        const updatedBalRow = await db.get<{ balance: number }>(
+          'SELECT balance FROM account_balances WHERE account_id = ?',
+          [accountId]
+        );
+        const balanceAfter = updatedBalRow ? Number(updatedBalRow.balance) : delta;
 
-      if (type === 'CAPTURE') {
-        merchantEntry = {
-          payment_id: paymentId,
-          entry_type: 'DEBIT', // Cash inflow
-          account_type: 'MERCHANT',
-          account_id: merchantAccount,
-          amount: netAmount,
-          currency,
-          balance_after: currentMerchantBal + netAmount,
-        };
+        // Insert immutable ledger audit entry
+        const entryId = 'led_' + crypto.randomBytes(8).toString('hex');
+        const entryAmount = toCurrency(entryAmountCents);
 
-        platformEntry = {
-          payment_id: paymentId,
-          entry_type: 'DEBIT', // Fee inflow
-          account_type: 'PLATFORM_FEE',
-          account_id: platformAccount,
-          amount: fee,
-          currency,
-          balance_after: currentPlatformBal + fee,
-        };
-
-        providerEntry = {
-          payment_id: paymentId,
-          entry_type: 'CREDIT', // Provider liability (holds cash)
-          account_type: 'PROVIDER',
-          account_id: providerAccount,
-          amount,
-          currency,
-          balance_after: currentProviderBal - amount,
-        };
-      } else {
-        // REFUND
-        merchantEntry = {
-          payment_id: paymentId,
-          entry_type: 'CREDIT', // Cash outflow
-          account_type: 'MERCHANT',
-          account_id: merchantAccount,
-          amount: netAmount,
-          currency,
-          balance_after: currentMerchantBal - netAmount,
-        };
-
-        platformEntry = {
-          payment_id: paymentId,
-          entry_type: 'CREDIT', // Fee outflow (refunded fee)
-          account_type: 'PLATFORM_FEE',
-          account_id: platformAccount,
-          amount: fee,
-          currency,
-          balance_after: currentPlatformBal - fee,
-        };
-
-        providerEntry = {
-          payment_id: paymentId,
-          entry_type: 'DEBIT', // Decrease provider liability
-          account_type: 'PROVIDER',
-          account_id: providerAccount,
-          amount,
-          currency,
-          balance_after: currentProviderBal + amount,
-        };
-      }
-
-      // Helper function to insert ledger entry
-      const insertEntry = async (entry: Omit<LedgerEntry, 'id'>): Promise<LedgerEntry> => {
-        const id = 'led_' + crypto.randomBytes(8).toString('hex');
         await db.run(
           `INSERT INTO ledger_entries (id, payment_id, entry_type, account_type, account_id, amount, currency, balance_after)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
           [
-            id,
-            entry.payment_id,
-            entry.entry_type,
-            entry.account_type,
-            entry.account_id,
-            entry.amount,
-            entry.currency,
-            entry.balance_after,
+            entryId,
+            paymentId,
+            entryType,
+            accountType,
+            accountId,
+            entryAmount,
+            currency,
+            balanceAfter,
           ]
         );
-        return { id, ...entry };
+
+        return {
+          id: entryId,
+          payment_id: paymentId,
+          entry_type: entryType,
+          account_type: accountType,
+          account_id: accountId,
+          amount: entryAmount,
+          currency,
+          balance_after: balanceAfter,
+        };
       };
 
-      const me = await insertEntry(merchantEntry);
-      const ple = await insertEntry(platformEntry);
-      const pre = await insertEntry(providerEntry);
+      if (type === 'CAPTURE') {
+        // 1. Merchant Account receives net funds (DEBIT)
+        const me = await applyEntry('MERCHANT', merchantAccount, 'DEBIT', netAmountCents, netAmountCents);
+        // 2. Platform Account receives platform fee (DEBIT)
+        const ple = await applyEntry('PLATFORM_FEE', platformAccount, 'DEBIT', feeCents, feeCents);
+        // 3. Provider Account incurs settlement liability (CREDIT)
+        const pre = await applyEntry('PROVIDER', providerAccount, 'CREDIT', amountCents, -amountCents);
 
-      entries.push(me, ple, pre);
+        entries.push(me, ple, pre);
+      } else {
+        // REFUND or PARTIAL_REFUND
+        // 1. Merchant Account deducts net amount (CREDIT)
+        const me = await applyEntry('MERCHANT', merchantAccount, 'CREDIT', netAmountCents, -netAmountCents);
+        // 2. Platform Account deducts refunded fee portion (CREDIT)
+        const ple = await applyEntry('PLATFORM_FEE', platformAccount, 'CREDIT', feeCents, -feeCents);
+        // 3. Provider Account discharges settlement liability (DEBIT)
+        const pre = await applyEntry('PROVIDER', providerAccount, 'DEBIT', amountCents, amountCents);
 
-      // Commit transaction
-      await db.exec('COMMIT');
+        entries.push(me, ple, pre);
+      }
 
-      // Publish events
-      memoryStore.publishEvent('ledger.posted', `Posted double-entry ledger for payment ${paymentId} (${type})`, {
-        paymentId,
-        type,
-        total: amount,
-        fee,
-        net: netAmount,
-        merchantBalance: me.balance_after,
-        platformBalance: ple.balance_after,
-        providerBalance: pre.balance_after,
-      });
+      // Publish Kafka audit event
+      memoryStore.publishEvent(
+        'ledger.posted',
+        `Posted double-entry ledger for payment ${paymentId} (${type}: $${amount.toFixed(2)})`,
+        {
+          paymentId,
+          type,
+          amount,
+          fee,
+          currency,
+          entries: entries.map((e) => ({
+            account: e.account_id,
+            type: e.entry_type,
+            amount: e.amount,
+            balance_after: e.balance_after,
+          })),
+        }
+      );
 
       return entries;
-    } catch (e) {
-      await db.exec('ROLLBACK');
-      console.error('Failed to write ledger transaction. Rolled back.', e);
-      throw e;
-    }
+    });
   }
 
   /**

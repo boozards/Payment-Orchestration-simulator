@@ -1,11 +1,6 @@
 # Orchestra: High-Reliability Payment Orchestration Platform
 
-<div align="left">
-  <img src="https://img.shields.io/badge/TypeScript-5.0-3178C6?style=flat-square&logo=typescript&logoColor=white" alt="TypeScript" />
-  <img src="https://img.shields.io/badge/Next.js-15%20App%20Router-black?style=flat-square&logo=next.js&logoColor=white" alt="Next.js" />
-  <img src="https://img.shields.io/badge/Accounting-Double--Entry%20Ledger-059669?style=flat-square" alt="Double-Entry Ledger" />
-  <img src="https://img.shields.io/badge/Security-PCI--DSS%20Tokenization-1E40AF?style=flat-square" alt="PCI Tokenization" />
-</div>
+
 
 ---
 

@@ -5,7 +5,6 @@
   <img src="https://img.shields.io/badge/Next.js-15%20App%20Router-black?style=flat-square&logo=next.js&logoColor=white" alt="Next.js" />
   <img src="https://img.shields.io/badge/Accounting-Double--Entry%20Ledger-059669?style=flat-square" alt="Double-Entry Ledger" />
   <img src="https://img.shields.io/badge/Security-PCI--DSS%20Tokenization-1E40AF?style=flat-square" alt="PCI Tokenization" />
-  <img src="https://img.shields.io/badge/Correctness-100%25%20Verified-16A34A?style=flat-square" alt="Tests" />
 </div>
 
 ---
